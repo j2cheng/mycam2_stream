@@ -1,0 +1,7 @@
+build/
+.gradle/
+local.properties
+.cxx/
+third_party/cerbero/build/
+third_party/cerbero/dist/
+third_party/gstreamer-android/
