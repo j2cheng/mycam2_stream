@@ -133,6 +133,7 @@ start()
  │     │     factory launch string:
  │     │       ( appsrc name=mysrc is-live=true do-timestamp=false format=time
  │     │         ! h265parse config-interval=1
+ │     │         ! video/x-h265,stream-format=byte-stream,alignment=au
  │     │         ! queue max-size-buffers=10 leaky=downstream
  │     │         ! rtph265pay name=pay0 config-interval=1 pt=96 )
  │     │     set_transport_mode(PLAY)      ← send-only
@@ -189,7 +190,9 @@ gst-rtsp-server: factory.create_element() → instantiate pipeline (first client
         │
         ├─ find appsrc "mysrc" in media's element
         ├─ g_object_set caps =
-        │     "video/x-h265, stream-format=byte-stream, alignment=au"
+        │     "video/x-h265, stream-format=byte-stream, alignment=nal"
+        │     (MediaCodec emits one NAL per output buffer; h265parse
+        │      re-aggregates to AU for the rtph265pay downstream)
         ├─ is-live=TRUE, do-timestamp=FALSE, format=GST_FORMAT_TIME
         ├─ pthread_mutex_lock(&g_lock); g_appsrc = ref(appsrc); unlock
         └─ connect signal "unprepared" → on_media_unprepared
@@ -201,16 +204,23 @@ Subsequent nativePushH265Data() calls:
    pthread_mutex_lock(&g_lock)
    if (g_appsrc) {
        GstBuffer *buf = gst_buffer_new_memdup(data, size)
-       GST_BUFFER_PTS(buf) = ptsUs * 1000               ← ns
-       GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf)
-       if (isCodecConfig) GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_HEADER)
-       if (!isKeyframe)   GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT)
+       if (isCodecConfig) {
+           GST_BUFFER_PTS(buf) = 0                      ← VPS/SPS/PPS on timeline
+           GST_BUFFER_DTS(buf) = 0
+           // no HEADER flag: h265parse caches param sets from byte stream,
+           // config-interval=1 re-injects before every keyframe
+       } else {
+           GST_BUFFER_PTS(buf) = ptsUs * 1000           ← ns, anchored at 0
+           GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf)
+           if (!isKeyframe) GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT)
+       }
        gst_app_src_push_buffer(g_appsrc, buf)           ← buffer ownership transfers
    }
    pthread_mutex_unlock(&g_lock)
         │
         ▼
-   appsrc → h265parse (re-frames AUs, injects VPS/SPS/PPS via config-interval=1)
+   appsrc → h265parse (re-aggregates NAL→AU, injects VPS/SPS/PPS via config-interval=1)
+          → caps filter (byte-stream, alignment=au)
           → queue (leaky=downstream; drops if RTSP backpressures)
           → rtph265pay (RFC 7798 packetization, pt=96, also config-interval=1)
           → RTSP server → RTP/UDP → client

@@ -2,8 +2,9 @@
 //
 // Native side of the streamer:
 //
-//   appsrc(name=mysrc, caps: byte-stream/au HEVC)
-//     -> h265parse
+//   appsrc(name=mysrc, caps: byte-stream/nal HEVC)
+//     -> h265parse (re-aggregates NAL -> AU)
+//     -> caps filter: byte-stream/au
 //     -> queue
 //     -> rtph265pay (config-interval=1, pt=96, send VPS/SPS/PPS periodically)
 //
@@ -38,6 +39,14 @@ static int               g_loop_thread_started = 0;
 static GstClockTime      g_first_pts   = GST_CLOCK_TIME_NONE;
 static GstClockTime      g_last_pts    = 0;
 
+// Cached HEVC codec config (VPS+SPS+PPS, Annex-B). MediaCodec emits this
+// exactly once at encoder start, long before any RTSP client connects, so we
+// stash it and replay it into appsrc every time a new media instance is
+// configured. Without this, h265parse never sees parameter sets and drops
+// every slice with "broken/invalid nal".
+static guint8           *g_csd         = NULL;
+static gsize             g_csd_size    = 0;
+
 // -------------------------------------------------------------------------
 // media-configure: grab the appsrc out of the pipeline whenever a client
 // triggers a new media instance, and wire its caps + live-source settings.
@@ -68,8 +77,11 @@ static void on_media_configure(GstRTSPMediaFactory *factory,
         return;
     }
 
+    // alignment=nal: MediaCodec on Android emits one NAL per output buffer
+    // (and concatenated VPS+SPS+PPS in the single CODEC_CONFIG buffer).
+    // h265parse will re-aggregate to AU for rtph265pay downstream.
     GstCaps *caps = gst_caps_from_string(
-        "video/x-h265, stream-format=(string)byte-stream, alignment=(string)au");
+        "video/x-h265, stream-format=(string)byte-stream, alignment=(string)nal");
 
     g_object_set(appsrc,
                  "stream-type",  0,                  // GST_APP_STREAM_TYPE_STREAM
@@ -78,6 +90,13 @@ static void on_media_configure(GstRTSPMediaFactory *factory,
                  "do-timestamp", FALSE,              // we provide PTS ourselves
                  "block",        FALSE,
                  "max-bytes",    (guint64) (4 * 1024 * 1024),
+                 // Explicit zero latency: we push frames as fast as MediaCodec
+                 // produces them. Without this the latency query returns
+                 // "unknown", and rtpsession logs "Can't determine running
+                 // time for this packet without knowing configured latency"
+                 // on the first packet.
+                 "min-latency",  (gint64) 0,
+                 "max-latency",  (gint64) 0,
                  "caps",         caps,
                  NULL);
     gst_caps_unref(caps);
@@ -91,6 +110,23 @@ static void on_media_configure(GstRTSPMediaFactory *factory,
     }
     g_appsrc = appsrc; // transfer ref
     g_first_pts = GST_CLOCK_TIME_NONE;
+
+    // Replay cached VPS/SPS/PPS into the freshly-wired appsrc so h265parse
+    // can validate slices from the very first frame this client sees.
+    if (g_csd && g_csd_size > 0) {
+        GstBuffer *csd_buf = gst_buffer_new_memdup(g_csd, g_csd_size);
+        if (csd_buf) {
+            GST_BUFFER_PTS(csd_buf)      = 0;
+            GST_BUFFER_DTS(csd_buf)      = 0;
+            GST_BUFFER_DURATION(csd_buf) = GST_CLOCK_TIME_NONE;
+            GstFlowReturn fret =
+                gst_app_src_push_buffer(GST_APP_SRC(appsrc), csd_buf);
+            LOGI("media-configure: replayed cached CSD (%zu bytes), ret=%d",
+                 g_csd_size, (int) fret);
+        }
+    } else {
+        LOGI("media-configure: no CSD cached yet");
+    }
     pthread_mutex_unlock(&g_lock);
 
     LOGI("media-configure: appsrc wired");
@@ -142,6 +178,7 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativeStartRtspServer(
     gst_rtsp_media_factory_set_launch(factory,
         "( appsrc name=mysrc is-live=true do-timestamp=false format=time "
         "  ! h265parse config-interval=1 "
+        "  ! video/x-h265,stream-format=byte-stream,alignment=au "
         "  ! queue max-size-buffers=10 max-size-time=0 max-size-bytes=0 leaky=downstream "
         "  ! rtph265pay name=pay0 config-interval=1 pt=96 )");
 
@@ -190,12 +227,32 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativePushH265Data(
         return;
     }
 
+    // Always cache the codec config, BEFORE the appsrc null-check, so that
+    // even if the CSD arrives before any RTSP client has connected (the
+    // normal case -- MediaCodec emits CSD once at encoder startup), we can
+    // still replay it later in on_media_configure for late-joining clients.
+    if (is_codec_config) {
+        jbyte *csd_src = (*env)->GetByteArrayElements(env, data, NULL);
+        if (csd_src) {
+            pthread_mutex_lock(&g_lock);
+            if (g_csd) { g_free(g_csd); g_csd = NULL; g_csd_size = 0; }
+            g_csd = g_malloc((gsize) size);
+            if (g_csd) {
+                memcpy(g_csd, csd_src, (size_t) size);
+                g_csd_size = (gsize) size;
+                LOGI("cached CSD (%d bytes)", (int) size);
+            }
+            pthread_mutex_unlock(&g_lock);
+            (*env)->ReleaseByteArrayElements(env, data, csd_src, JNI_ABORT);
+        }
+    }
+
     pthread_mutex_lock(&g_lock);
     GstElement *appsrc = g_appsrc ? gst_object_ref(g_appsrc) : NULL;
     pthread_mutex_unlock(&g_lock);
 
     if (!appsrc) {
-        return; // no client yet, drop
+        return; // no client yet, drop (CSD is already cached above)
     }
 
     jbyte *src = (*env)->GetByteArrayElements(env, data, NULL);
@@ -215,10 +272,14 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativePushH265Data(
     GstClockTime pts = (GstClockTime) pts_us * GST_USECOND;
 
     if (is_codec_config) {
-        // SPS/VPS/PPS: header buffer, no useful timestamp.
-        GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_HEADER);
-        GST_BUFFER_PTS(buf)      = GST_CLOCK_TIME_NONE;
-        GST_BUFFER_DTS(buf)      = GST_CLOCK_TIME_NONE;
+        // VPS/SPS/PPS in Annex-B form. h265parse picks them up from the
+        // byte stream like any other NAL (it doesn't rely on HEADER flag
+        // for HEVC), then re-injects them inline before every keyframe
+        // because of config-interval=1. Stamp PTS=0 so the buffer stays on
+        // the same timeline as the first frame -- appsrc in is-live=TRUE
+        // mode with do-timestamp=FALSE dislikes PTS_NONE buffers.
+        GST_BUFFER_PTS(buf)      = 0;
+        GST_BUFFER_DTS(buf)      = 0;
         GST_BUFFER_DURATION(buf) = GST_CLOCK_TIME_NONE;
     } else {
         pthread_mutex_lock(&g_lock);
@@ -294,5 +355,12 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativeStopRtspServer(
     if (ctx) {
         g_main_context_unref(ctx);
     }
+
+    if (g_csd) {
+        g_free(g_csd);
+        g_csd = NULL;
+        g_csd_size = 0;
+    }
+
     LOGI("RTSP server stopped");
 }
