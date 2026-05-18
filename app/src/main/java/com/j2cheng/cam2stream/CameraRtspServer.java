@@ -37,9 +37,9 @@ public final class CameraRtspServer {
     private static final String TAG = "CameraRtspServer";
 
     private static final String MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_HEVC; // "video/hevc"
-    private static final int WIDTH = 1920;
-    private static final int HEIGHT = 1080;
-    private static final int BITRATE = 4_500_000; // 4.5 Mbps
+    private static final int WIDTH = 3840;
+    private static final int HEIGHT = 2160;
+    private static final int BITRATE = 15_000_000; // 15 Mbps (4K HEVC)
     private static final int FRAME_RATE = 30;
     private static final int I_FRAME_INTERVAL_SEC = 1;
     private static final int RTSP_PORT = 8554;
@@ -286,6 +286,16 @@ public final class CameraRtspServer {
                     break;
                 }
                 if (idx < 0) {
+                    if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        // Encoder has negotiated its actual output format
+                        // (profile, level, csd-0/1, bit-rate, frame-rate ...).
+                        // Useful for confirming what HEVC profile/level the
+                        // hardware actually picked.
+                        try {
+                            MediaFormat out = mediaCodec.getOutputFormat();
+                            Log.i(TAG, "encoder negotiated format: " + out);
+                        } catch (IllegalStateException ignored) {}
+                    }
                     continue; // INFO_TRY_AGAIN_LATER / INFO_OUTPUT_FORMAT_CHANGED / etc.
                 }
                 ByteBuffer outBuf = mediaCodec.getOutputBuffer(idx);
