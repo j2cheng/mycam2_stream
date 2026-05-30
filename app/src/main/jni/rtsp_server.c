@@ -142,7 +142,15 @@ static void *loop_thread_main(void *unused) {
     g_main_context_pop_thread_default(g_loop_ctx);
     return NULL;
 }
+static GstRTSPFilterResult
+kick_all_clients_filter(GstRTSPServer *server, GstRTSPClient *client, gpointer user_data) {
+    (void)server; (void)client; (void)user_data;
+    // Tell GStreamer to immediately disconnect and destroy this client
 
+    LOGI("kick_all_clients_filter: server[%p[, client[%p]",server,client);
+
+    return GST_RTSP_FILTER_REMOVE;
+}
 // -------------------------------------------------------------------------
 // JNI: nativeStartRtspServer(int port, String mountPath)
 // -------------------------------------------------------------------------
@@ -340,6 +348,7 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativeStopRtspServer(
         gst_app_src_end_of_stream(GST_APP_SRC(g_appsrc));
         gst_object_unref(g_appsrc);
         g_appsrc = NULL;
+        LOGI("nativeStopRtspServer: g_appsrc set to NULL");
     }
 
     // 2. CLOSE THE FRONT DOOR FIRST (Synchronous)
@@ -349,10 +358,12 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativeStopRtspServer(
             g_source_destroy(src);
         }
         g_server_id = 0;
+        LOGI("nativeStopRtspServer: g_server_id set to 0");
     }
 
     // 3. KICK REMAINING CLIENTS (Schedules deferred removal on the GLib thread)
     if (g_server) {
+        LOGI("nativeStopRtspServer: call client_filter");
         gst_rtsp_server_client_filter(g_server, kick_all_clients_filter, NULL);
     }
 
@@ -374,17 +385,21 @@ Java_com_j2cheng_cam2stream_CameraRtspServer_nativeStopRtspServer(
         // This blocks JNI until the GLib thread processes the loop quit 
         // AND all deferred client removals scheduled by the filter are done.
         pthread_join(g_loop_thread, NULL);
+        LOGI("nativeStopRtspServer: pthread_join returned");
     }
 
     // 6. SAFE TO DESTROY OBJECTS (Ref counts are guaranteed to be 0 now)
     if (loop) {
         g_main_loop_unref(loop);
+        LOGI("nativeStopRtspServer: g_main_loop_unref loop");
     }
     if (srv) {
         g_object_unref(srv);// <-- THIS is where the state becomes NULL
+        LOGI("nativeStopRtspServer: g_object_unref server");
     }
     if (ctx) {
         g_main_context_unref(ctx);
+        LOGI("nativeStopRtspServer: g_object_unref ctx");
     }
 
     if (g_csd) {
