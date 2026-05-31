@@ -10,7 +10,7 @@
 # We deliberately do NOT pre-install any GStreamer libraries: Cerbero builds
 # them from source as part of build-gstreamer-android.sh.
 
-FROM debian:trixie-slim
+FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
