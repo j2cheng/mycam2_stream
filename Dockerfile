@@ -19,26 +19,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ---------------------------------------------------------------------------
 # Host packages
 #
-# - build-essential, autotools, pkg-config, cmake, ninja, meson, flex, bison,
-#   gettext, gperf, nasm, yasm, intltool, libtool, file, patch, perl, python3,
-#   python3-{pip,setuptools,venv}: Cerbero's host-side build prerequisites.
-#   Cerbero's `bootstrap` step will apt-install anything else it needs, which
-#   is why we install sudo/apt-utils and run the build as root.
-# - git, curl, wget, ca-certificates, unzip, xz-utils, bzip2: source fetch +
-#   tarball extraction (Cerbero, Android cmdline-tools, GStreamer SDK tarball).
-# - openjdk-17-jdk-headless: required by AGP 8.5. (Trixie *does* ship a
-#   headless variant even though the full openjdk-17-jdk metapackage was
-#   dropped; that satisfies Gradle/AGP fine.)
-# - locales: keep UTF-8 stable across Gradle output.
+# Two groups:
+#
+# 1. Tools we need directly (curl/git/JDK/etc).
+# 2. Everything Cerbero's bootstrap step (`cerbero bootstrap`) tries to
+#    apt-install on Debian. Cerbero invokes `apt-get -y install ...` directly
+#    without running `apt-get update` first, so we must (a) pre-install those
+#    packages and (b) keep /var/lib/apt/lists populated so any redundant
+#    install call still succeeds. The list is taken from
+#    cerbero/bootstrap/linux.py (Debian distro).
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget git unzip zip xz-utils bzip2 file patch sudo \
-        build-essential autoconf automake libtool libtool-bin pkg-config cmake \
+        build-essential autoconf automake autotools-dev autopoint \
+        libtool libtool-bin pkg-config cmake make g++ \
         ninja-build meson flex bison gettext gperf nasm yasm intltool \
-        python3 python3-pip python3-setuptools python3-venv python3-distro \
+        ccache xutils-dev \
+        python3 python3-pip python3-setuptools python3-venv python3-distro python3-dev \
         perl rsync locales \
+        libssl-dev libpulse-dev libasound2-dev \
+        libx11-dev libx11-xcb-dev libxv-dev libxext-dev libxi-dev \
+        libxrender-dev libxfixes-dev libxdamage-dev libxcomposite-dev \
+        libxtst-dev libxrandr-dev x11proto-record-dev \
+        libgl1-mesa-dev libglu1-mesa-dev libegl1-mesa-dev \
         openjdk-17-jdk-headless \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean
 
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH=$JAVA_HOME/bin:$PATH
