@@ -1,0 +1,111 @@
+name: Build APK
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    needs: image
+    runs-on: ubuntu-latest
+    # Run all steps inside the image defined by ./Dockerfile. The `image` job
+    # below builds and pushes it to GHCR before this job starts.
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/mycam2-stream-build:latest
+      options: --user root
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------
+      # Cache the GStreamer Android SDK produced by Cerbero. Building it
+      # from source takes a long time; key on the script + Cerbero ref so
+      # the cache invalidates whenever the build inputs change.
+      # -----------------------------------------------------------------
+      - name: Cache GStreamer Android SDK
+        id: cache-gst
+        uses: actions/cache@v4
+        with:
+          path: third_party/gstreamer-android
+          key: gst-android-${{ runner.os }}-${{ hashFiles('scripts/build-gstreamer-android.sh') }}
+
+      - name: Cache Cerbero home
+        if: steps.cache-gst.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /root/cerbero-home
+          key: cerbero-home-${{ runner.os }}-${{ hashFiles('scripts/build-gstreamer-android.sh') }}
+          restore-keys: |
+            cerbero-home-${{ runner.os }}-
+
+      - name: Build GStreamer Android SDK (Cerbero)
+        if: steps.cache-gst.outputs.cache-hit != 'true'
+        run: |
+          chmod +x scripts/build-gstreamer-android.sh
+          ./scripts/build-gstreamer-android.sh
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew scripts/build-app.sh
+          # The script defaults JAVA_HOME to ~/jdk/... ; override with the
+          # JDK installed in the container image.
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export ANDROID_HOME=/opt/android-sdk
+          export GSTREAMER_ROOT_ANDROID="$PWD/third_party/gstreamer-android"
+          ./scripts/build-app.sh debug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Build (and push, on main) the container image used by the `build` job.
+  # Pushing to GHCR lets subsequent runs reuse the layers without rebuilding
+  # the Android SDK + JDK every time.
+  # -------------------------------------------------------------------------
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mycam2-stream-build:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
