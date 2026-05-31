@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget git unzip zip xz-utils bzip2 file patch sudo \
         build-essential autoconf automake libtool libtool-bin pkg-config cmake \
         ninja-build meson flex bison gettext gperf nasm yasm intltool \
-        python3 python3-pip python3-setuptools python3-venv \
+        python3 python3-pip python3-setuptools python3-venv python3-distro \
         perl rsync locales \
         openjdk-17-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
